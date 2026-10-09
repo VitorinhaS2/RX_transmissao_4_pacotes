@@ -1,23 +1,14 @@
-
-// Declaração de bibliotecas 
+// Declaração de bibliotecas
 #include <Arduino.h>
 #include "LoRaWan_APP.h"
 #include "LoRaConfig.h"
 #include "HT_SSD1306Wire.h"
 #include "sd_read_write.h"
 
-
 // CONFIGURAÇÕES
-#define TOTAL_PACOTES   2400
+#define TOTAL_PACOTES 2400
 #define TAMANHO_PACOTE 255
-
-// Pacote especial enviado pelo TX para finalizar
 #define BYTE_FINALIZACAO 0xFF
-
-// ARQUIVOS NO CARTÃO SD
-
-#define ARQUIVO_TXT "/lora_experimento.txt"
-#define ARQUIVO_CSV "/lora_experimento.csv"
 
 // OLED
 static SSD1306Wire display(0x3C, 500000, SDA_OLED, SCL_OLED, GEOMETRY_128_64, RST_OLED);
@@ -27,141 +18,104 @@ static RadioEvents_t RadioEvents;
 
 // CARTÃO SD
 SPIClass sd_spi(HSPI);
-
 File arquivoTXT;
 File arquivoCSV;
-
 bool sdOK = false;
 
-
 // VARIÁVEIS DO EXPERIMENTO
-
 uint32_t pacotesRecebidos = 0;
 uint32_t pacotesInvalidos = 0;
-
 uint32_t pacotesIntegridadeOK = 0;
 uint32_t pacotesIntegridadeERRO = 0;
-
 int16_t rssiAtual = 0;
 int32_t somaRSSI = 0;
-
 int8_t snrAtual = 0;
 int32_t somaSNR = 0;
-
 uint16_t tamanhoRecebido = 0;
 
-
 // CONTROLE
-
 bool pacoteRecebido = false;
-
 bool experimentoIniciado = false;
 bool experimentoFinalizado = false;
-
 unsigned long inicioExperimento = 0;
 
+// Número do experimento atual
+// A cada reinicialização procura o próximo número disponível
+int numeroExperimento = 0;
 
-// INICIALIZAÇÃO DO SD
-
-bool inicializarSD()
+// Função pra ligar o display OLED da Heltec
+void VextON()
 {
-    Serial.println();
-    Serial.println("Inicializando cartao SD...");
-
-    sd_spi.begin(SCK, MISO, MOSI, CS);
-
-    if (!SD.begin(CS, sd_spi)){
-        Serial.println("ERRO: Card Mount Failed");
-        return false;
-    }
-
-    uint8_t cardType = SD.cardType();
-
-    if (cardType == CARD_NONE){
-        Serial.println("ERRO: Nenhum cartao SD encontrado.");
-        return false;
-    }
-
-    Serial.print("Tipo do cartao: ");
-
-    if (cardType == CARD_MMC){
-        Serial.println("MMC");
-    } else if (cardType == CARD_SD) {
-        Serial.println("SDSC");
-    } else if (cardType == CARD_SDHC) {
-        Serial.println("SDHC");
-    } else {
-        Serial.println("UNKNOWN");
-    }
-
-    uint64_t cardSize = SD.cardSize() / (1024 * 1024);
-
-    Serial.print("Tamanho do cartao: ");
-    Serial.print(cardSize);
-    Serial.println(" MB");
-
-    return true;
+    pinMode(Vext, OUTPUT);
+    digitalWrite(Vext, LOW);
 }
 
-// função para criar oas arquivos tanto em txt quanto csv pra melhor vizualização dos dados.
+void VextOFF()
+{
+    pinMode(Vext, OUTPUT);
+    digitalWrite(Vext, HIGH);
+}
 
+// CRIA ARQUIVOS
+// Cria um novo par de arquivos sem apagar os experimentos anteriores
 bool criarArquivos()
 {
-    // Remove arquivos antigos
+    char nomeTXT[40];
+    char nomeCSV[40];
 
-    if (SD.exists(ARQUIVO_TXT)) {
-        SD.remove(ARQUIVO_TXT);
+    numeroExperimento = 1;
+
+    // Procura o primeiro número de experimento que ainda não existe
+    while (true)
+    {
+        sprintf(nomeTXT, "/lora_experimento_%03d.txt", numeroExperimento);
+        sprintf(nomeCSV, "/lora_experimento_%03d.csv", numeroExperimento);
+
+        if (!SD.exists(nomeTXT) && !SD.exists(nomeCSV))
+        {
+            break;
+        }
+
+        numeroExperimento++;
     }
 
-    if (SD.exists(ARQUIVO_CSV)) {
-        SD.remove(ARQUIVO_CSV);
-    }
+    // Cria o arquivo TXT
+    arquivoTXT = SD.open(nomeTXT, FILE_WRITE);
 
-    // TXT
-
-    arquivoTXT = SD.open(ARQUIVO_TXT, FILE_WRITE);
-
-    if (!arquivoTXT) {
+    if (!arquivoTXT)
+    {
         Serial.println("ERRO ao criar TXT.");
         return false;
     }
 
-    arquivoTXT.println(
-        "PACOTE | TEMPO_MS | DADOS | TAMANHO | RSSI | SNR | INTEGRIDADE"
-    );
+    arquivoTXT.println("PACOTE | TEMPO_MS | DADOS | TAMANHO | RSSI | SNR | INTEGRIDADE");
 
-    arquivoTXT.flush();
+    // Cria o arquivo CSV
+    arquivoCSV = SD.open(nomeCSV, FILE_WRITE);
 
-    // CSV
-
-    arquivoCSV = SD.open(ARQUIVO_CSV, FILE_WRITE);
-
-    if (!arquivoCSV) {
+    if (!arquivoCSV)
+    {
         Serial.println("ERRO ao criar CSV.");
         arquivoTXT.close();
         return false;
     }
 
-    arquivoCSV.println(
-        "pacote;tempo_ms;dados_recebidos;tamanho;rssi;snr;integridade"
-    );
+    arquivoCSV.println("pacote;tempo_ms;dados_recebidos;tamanho;rssi;snr;integridade");
 
+    // Garante que os cabeçalhos sejam gravados no cartão
+    arquivoTXT.flush();
     arquivoCSV.flush();
 
     Serial.println("Arquivos criados:");
-    Serial.println(ARQUIVO_TXT);
-    Serial.println(ARQUIVO_CSV);
+    Serial.println(nomeTXT);
+    Serial.println(nomeCSV);
 
     return true;
 }
 
-
 // VERIFICA PACOTE DE FINALIZAÇÃO
-
-bool ehPacoteFinalizacao(
-    uint8_t *payload,
-    uint16_t size
-)
+// O pacote de finalização possui 255 bytes iguais a FF
+bool ehPacoteFinalizacao(uint8_t *payload, uint16_t size)
 {
     if (size != TAMANHO_PACOTE)
     {
@@ -179,28 +133,16 @@ bool ehPacoteFinalizacao(
     return true;
 }
 
-
 // VERIFICA INTEGRIDADE DO PACOTE
-//
-// O TX envia:
-// 00 01 02 03 ... FC FD FE
-//
-// Portanto:
-// payload[0] = 0
-// payload[1] = 1
-// ...
-// payload[254] = 254
-//
-
+// O TX envia: 00 01 02 03 ... FC FD FE
+// payload[0] = 0, payload[1] = 1, ... payload[254] = 254
 bool verificarIntegridade(uint8_t *payload, uint16_t size)
 {
-    // Primeiro verifica o tamanho
     if (size != TAMANHO_PACOTE)
     {
         return false;
     }
 
-    // Depois verifica cada byte
     for (uint16_t i = 0; i < TAMANHO_PACOTE; i++)
     {
         if (payload[i] != (uint8_t)i)
@@ -212,14 +154,8 @@ bool verificarIntegridade(uint8_t *payload, uint16_t size)
     return true;
 }
 
-
 // ESCREVE OS BYTES EM HEXADECIMAL
-
-void escreverBytesHexTXT(
-    File &arquivo,
-    uint8_t *payload,
-    uint16_t size
-)
+void escreverBytesHexTXT(File &arquivo, uint8_t *payload, uint16_t size)
 {
     for (uint16_t i = 0; i < size; i++)
     {
@@ -236,15 +172,9 @@ void escreverBytesHexTXT(
         }
     }
 }
-
 
 // ESCREVE OS BYTES HEX NO CSV
-
-void escreverBytesHexCSV(
-    File &arquivo,
-    uint8_t *payload,
-    uint16_t size
-)
+void escreverBytesHexCSV(File &arquivo, uint8_t *payload, uint16_t size)
 {
     for (uint16_t i = 0; i < size; i++)
     {
@@ -262,41 +192,18 @@ void escreverBytesHexCSV(
     }
 }
 
-
 // SALVA PACOTE NOS DOIS ARQUIVOS
-
-void salvarPacote(
-    uint8_t *payload,
-    uint16_t size,
-    int16_t rssi,
-    int8_t snr
-)
+void salvarPacote(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr)
 {
     if (!sdOK)
     {
         return;
     }
 
-
-    unsigned long tempoAtual = 0;
-
-    if (experimentoIniciado)
-    {
-        tempoAtual = millis() - inicioExperimento;
-    }
-
-
-    bool integridadeOK =
-        verificarIntegridade(payload, size);
-
+    unsigned long tempoAtual = millis() - inicioExperimento;
+    bool integridadeOK = verificarIntegridade(payload, size);
 
     // CONTROLE DE INTEGRIDADE
-
-    if (size != TAMANHO_PACOTE)
-    {
-        pacotesInvalidos++;
-    }
-
     if (integridadeOK)
     {
         pacotesIntegridadeOK++;
@@ -307,103 +214,64 @@ void salvarPacote(
     }
 
     // TXT
-
     if (arquivoTXT)
     {
         arquivoTXT.print(pacotesRecebidos);
         arquivoTXT.print(" | ");
-
         arquivoTXT.print(tempoAtual);
         arquivoTXT.print(" | ");
 
-        escreverBytesHexTXT(
-            arquivoTXT,
-            payload,
-            size
-        );
+        escreverBytesHexTXT(arquivoTXT, payload, size);
 
         arquivoTXT.print(" | ");
-
         arquivoTXT.print(size);
         arquivoTXT.print(" | ");
-
         arquivoTXT.print(rssi);
         arquivoTXT.print(" | ");
-
         arquivoTXT.print(snr);
         arquivoTXT.print(" | ");
-
-        if (integridadeOK)
-        {
-            arquivoTXT.println("OK");
-        }
-        else
-        {
-            arquivoTXT.println("ERRO");
-        }
+        arquivoTXT.println(integridadeOK ? "OK" : "ERRO");
     }
 
     // CSV
-
     if (arquivoCSV)
     {
         arquivoCSV.print(pacotesRecebidos);
         arquivoCSV.print(";");
-
         arquivoCSV.print(tempoAtual);
         arquivoCSV.print(";");
 
-        escreverBytesHexCSV(
-            arquivoCSV,
-            payload,
-            size
-        );
+        escreverBytesHexCSV(arquivoCSV, payload, size);
 
         arquivoCSV.print(";");
-
         arquivoCSV.print(size);
         arquivoCSV.print(";");
-
         arquivoCSV.print(rssi);
         arquivoCSV.print(";");
-
         arquivoCSV.print(snr);
         arquivoCSV.print(";");
-
-        if (integridadeOK) {
-            arquivoCSV.println("OK");
-        }
-        else{
-            arquivoCSV.println("ERRO");
-        }
+        arquivoCSV.println(integridadeOK ? "OK" : "ERRO");
     }
 
-
-    // Grava fisicamente no cartão
-
-    arquivoTXT.flush();
-    arquivoCSV.flush();
+    // O flush não é feito a cada pacote porque isso aumenta o tempo de gravação no cartão SD.
+    // A cada 10 pacotes os dados são forçados para o cartão.
+    if (pacotesRecebidos % 10 == 0)
+    {
+        if (arquivoTXT) arquivoTXT.flush();
+        if (arquivoCSV) arquivoCSV.flush();
+    }
 }
 
-
 // CALLBACK DE RECEPÇÃO
-
-void OnRxDone(
-    uint8_t *payload,
-    uint16_t size,
-    int16_t rssi,
-    int8_t snr
-)
+void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr)
 {
-    // Se já terminou, não processa
+    // Se já terminou, não processa mais pacotes
     if (experimentoFinalizado)
     {
         return;
     }
 
-
     // PACOTE DE FINALIZAÇÃO
-
     if (ehPacoteFinalizacao(payload, size))
     {
         rssiAtual = rssi;
@@ -413,8 +281,6 @@ void OnRxDone(
         Serial.println("=================================");
         Serial.println("    FINALIZACAO RECEBIDA");
         Serial.println("=================================");
-        Serial.println();
-
 
         // Fecha os arquivos antes de finalizar
         if (arquivoTXT)
@@ -429,104 +295,61 @@ void OnRxDone(
             arquivoCSV.close();
         }
 
-
         Radio.Sleep();
-
         experimentoFinalizado = true;
-
         mostrarResultadoFinal();
-
         return;
     }
 
-
     // PACOTE NORMAL
-
     if (size == TAMANHO_PACOTE)
     {
         // Copia os dados para o buffer global
-        memcpy(
-            rxpacket,
-            payload,
-            TAMANHO_PACOTE
-        );
-
+        memcpy(rxpacket, payload, TAMANHO_PACOTE);
 
         tamanhoRecebido = size;
-
         rssiAtual = rssi;
         snrAtual = snr;
 
-
-        // ----------------------------------------------------
         // Primeiro pacote
-        // ----------------------------------------------------
-
         if (!experimentoIniciado)
         {
             experimentoIniciado = true;
-
             inicioExperimento = millis();
 
             Serial.println();
             Serial.println("=================================");
             Serial.println("    EXPERIMENTO INICIADO");
             Serial.println("=================================");
-            Serial.println();
         }
 
-
-        // ----------------------------------------------------
-        // Conta pacote
-        // ----------------------------------------------------
-
+        // Conta pacote e atualiza RSSI/SNR
         pacotesRecebidos++;
-
         somaRSSI += rssi;
         somaSNR += snr;
 
-
-        // ----------------------------------------------------
         // Marca pacote recebido
-        // ----------------------------------------------------
-
         pacoteRecebido = true;
 
-
-        // ----------------------------------------------------
         // Salva no SD
-        // ----------------------------------------------------
-
-        salvarPacote(
-            payload,
-            size,
-            rssi,
-            snr
-        );
+        salvarPacote(payload, size, rssi, snr);
     }
     else
     {
         pacotesInvalidos++;
 
-        Serial.print(
-            "Pacote com tamanho inesperado: "
-        );
-
+        Serial.print("Pacote com tamanho inesperado: ");
         Serial.println(size);
     }
 
-
     // CONTINUA ESCUTANDO
-
     if (!experimentoFinalizado)
     {
         Radio.Rx(0);
     }
 }
 
-
 // TIMEOUT
-
 void OnRxTimeout(void)
 {
     if (!experimentoFinalizado)
@@ -535,9 +358,7 @@ void OnRxTimeout(void)
     }
 }
 
-
 // ERRO
-
 void OnRxError(void)
 {
     if (!experimentoFinalizado)
@@ -546,291 +367,144 @@ void OnRxError(void)
     }
 }
 
-
 // DISPLAY
-
 void atualizarDisplay()
 {
     float percentualPerda = 0.0;
 
-
     if (pacotesRecebidos <= TOTAL_PACOTES)
     {
-        percentualPerda =
-            ((float)(
-                TOTAL_PACOTES -
-                pacotesRecebidos
-            ) / TOTAL_PACOTES) * 100.0;
+        percentualPerda = ((float)(TOTAL_PACOTES - pacotesRecebidos) / TOTAL_PACOTES) * 100.0;
     }
 
-
     display.clear();
+    display.setFont(ArialMT_Plain_10);
+    display.setTextAlignment(TEXT_ALIGN_LEFT);
 
-
-    display.drawString(
-        0,
-        0,
-        "EXPERIMENTO LoRa"
-    );
-
-
-    display.drawString(
-        0,
-        12,
-        "TX: " + String(TOTAL_PACOTES)
-    );
-
-
-    display.drawString(
-        0,
-        24,
-        "RX: " + String(pacotesRecebidos)
-    );
-
-
-    display.drawString(
-        0,
-        36,
-        "Perda: " +
-        String(percentualPerda, 2) +
-        "%"
-    );
-
-
-    display.drawString(
-        0,
-        48,
-        "RSSI: " +
-        String(rssiAtual) +
-        " dBm"
-    );
-
+    display.drawString(0, 0, "EXPERIMENTO LoRa");
+    display.drawString(0, 12, "TX: " + String(TOTAL_PACOTES));
+    display.drawString(0, 24, "RX: " + String(pacotesRecebidos));
+    display.drawString(0, 36, "Perda: " + String(percentualPerda, 2) + "%");
+    display.drawString(0, 48, "RSSI: " + String(rssiAtual) + " dBm");
 
     display.display();
 }
 
-
 // RESULTADO FINAL
-
 void mostrarResultadoFinal()
 {
-    float percentualPerda = 0.0;
-
     uint32_t pacotesPerdidos = 0;
-
-
-    if (pacotesRecebidos <= TOTAL_PACOTES)
-    {
-        pacotesPerdidos =
-            TOTAL_PACOTES -
-            pacotesRecebidos;
-
-        percentualPerda =
-            ((float)pacotesPerdidos /
-             TOTAL_PACOTES) * 100.0;
-    }
-
-
+    float percentualPerda = 0.0;
     float rssiMedio = 0.0;
     float snrMedio = 0.0;
 
+    if (pacotesRecebidos <= TOTAL_PACOTES)
+    {
+        pacotesPerdidos = TOTAL_PACOTES - pacotesRecebidos;
+        percentualPerda = ((float)pacotesPerdidos / TOTAL_PACOTES) * 100.0;
+    }
 
     if (pacotesRecebidos > 0)
     {
-        rssiMedio =
-            (float)somaRSSI /
-            pacotesRecebidos;
-
-        snrMedio =
-            (float)somaSNR /
-            pacotesRecebidos;
+        rssiMedio = (float)somaRSSI / pacotesRecebidos;
+        snrMedio = (float)somaSNR / pacotesRecebidos;
     }
 
-
     // SERIAL
-
     Serial.println();
     Serial.println("=================================");
     Serial.println("       RESULTADO FINAL");
     Serial.println("=================================");
 
-
     Serial.print("Pacotes esperados: ");
     Serial.println(TOTAL_PACOTES);
-
 
     Serial.print("Pacotes recebidos: ");
     Serial.println(pacotesRecebidos);
 
-
     Serial.print("Pacotes perdidos: ");
     Serial.println(pacotesPerdidos);
-
 
     Serial.print("Percentual de perda: ");
     Serial.print(percentualPerda, 2);
     Serial.println("%");
 
-
     Serial.print("RSSI medio: ");
     Serial.print(rssiMedio, 2);
     Serial.println(" dBm");
-
 
     Serial.print("SNR medio: ");
     Serial.print(snrMedio, 2);
     Serial.println(" dB");
 
-
     Serial.print("Ultimo RSSI: ");
     Serial.print(rssiAtual);
     Serial.println(" dBm");
 
-
     Serial.print("Pacotes tamanho incorreto: ");
     Serial.println(pacotesInvalidos);
-
 
     Serial.print("Integridade OK: ");
     Serial.println(pacotesIntegridadeOK);
 
-
     Serial.print("Integridade ERRO: ");
     Serial.println(pacotesIntegridadeERRO);
 
-
     Serial.println("=================================");
 
-
     // OLED
-
     display.clear();
+    display.setFont(ArialMT_Plain_10);
+    display.setTextAlignment(TEXT_ALIGN_LEFT);
 
-
-    display.drawString(
-        0,
-        0,
-        "RESULTADO FINAL"
-    );
-
-
-    display.drawString(
-        0,
-        12,
-        "RX: " +
-        String(pacotesRecebidos)
-    );
-
-
-    display.drawString(
-        0,
-        24,
-        "Perdidos: " +
-        String(pacotesPerdidos)
-    );
-
-
-    display.drawString(
-        0,
-        36,
-        "Perda: " +
-        String(percentualPerda, 2) +
-        "%"
-    );
-
-
-    display.drawString(
-        0,
-        48,
-        "RSSI: " +
-        String(rssiMedio, 1)
-    );
-
+    display.drawString(0, 0, "RESULTADO FINAL");
+    display.drawString(0, 12, "RX: " + String(pacotesRecebidos));
+    display.drawString(0, 24, "Perdidos: " + String(pacotesPerdidos));
+    display.drawString(0, 36, "Perda: " + String(percentualPerda, 2) + "%");
+    display.drawString(0, 48, "RSSI: " + String(rssiMedio, 1));
 
     display.display();
 }
 
-
 // SETUP
-
 void setup()
 {
     Serial.begin(115200);
-
     delay(1000);
-
 
     Serial.println();
     Serial.println("=================================");
     Serial.println("       RX LoRa - EXPERIMENTO");
     Serial.println("=================================");
-    Serial.println();
 
-
-    // --------------------------------------------------------
     // Inicializa placa
-    // --------------------------------------------------------
+    Mcu.begin(HELTEC_BOARD, SLOW_CLK_TPYE);
 
-    Mcu.begin(
-        HELTEC_BOARD,
-        SLOW_CLK_TPYE
-    );
-
-
-    // --------------------------------------------------------
     // OLED
-    // --------------------------------------------------------
+    VextON();
+    delay(200);
 
     display.init();
-
     display.clear();
-
-    display.drawString(
-        0,
-        0,
-        "RX LoRa"
-    );
-
-    display.drawString(
-        0,
-        15,
-        "Inicializando..."
-    );
-
+    display.setFont(ArialMT_Plain_10);
+    display.setTextAlignment(TEXT_ALIGN_LEFT);
+    display.drawString(0, 0, "RX LoRa");
+    display.drawString(0, 15, "Inicializando...");
     display.display();
 
-
-    // --------------------------------------------------------
     // SD
-    // --------------------------------------------------------
+    sd_spi.begin(SCK, MISO, MOSI, CS);
 
-    sdOK = inicializarSD();
-
-
-    if (!sdOK)
+    if (!SD.begin(CS, sd_spi) || SD.cardType() == CARD_NONE)
     {
+        sdOK = false;
+
         display.clear();
-
-        display.drawString(
-            0,
-            0,
-            "ERRO SD"
-        );
-
-        display.drawString(
-            0,
-            15,
-            "Verifique cartao"
-        );
-
+        display.drawString(0, 0, "ERRO SD");
+        display.drawString(0, 15, "Verifique cartao");
         display.display();
 
-
-        Serial.println();
-        Serial.println(
-            "ERRO: SD nao inicializado."
-        );
-
+        Serial.println("ERRO: SD nao inicializado.");
 
         while (true)
         {
@@ -838,23 +512,14 @@ void setup()
         }
     }
 
+    sdOK = true;
 
-    // --------------------------------------------------------
     // Cria arquivos
-    // --------------------------------------------------------
-
     if (!criarArquivos())
     {
         display.clear();
-
-        display.drawString(
-            0,
-            0,
-            "ERRO ARQUIVO"
-        );
-
+        display.drawString(0, 0, "ERRO ARQUIVO");
         display.display();
-
 
         while (true)
         {
@@ -862,31 +527,16 @@ void setup()
         }
     }
 
-
-    // --------------------------------------------------------
     // Callbacks
-    // --------------------------------------------------------
-
     RadioEvents.RxDone = OnRxDone;
     RadioEvents.RxTimeout = OnRxTimeout;
     RadioEvents.RxError = OnRxError;
 
-
-    // --------------------------------------------------------
     // Inicializa rádio
-    // --------------------------------------------------------
-
     Radio.Init(&RadioEvents);
+    Radio.SetChannel(RF_FREQUENCY);
 
-    Radio.SetChannel(
-        RF_FREQUENCY
-    );
-
-
-    // --------------------------------------------------------
     // Configuração RX
-    // --------------------------------------------------------
-
     Radio.SetRxConfig(
         MODEM_LORA,
         LORA_BANDWIDTH,
@@ -904,118 +554,58 @@ void setup()
         true
     );
 
-
-    Serial.println(
-        "Radio inicializado."
-    );
-
-    Serial.println(
-        "SD inicializado."
-    );
-
-    Serial.println(
-        "Aguardando pacotes..."
-    );
-
-    Serial.println();
-
+    Serial.println("Radio inicializado.");
+    Serial.println("SD inicializado.");
+    Serial.println("Aguardando pacotes...");
 
     display.clear();
-
-    display.drawString(
-        0,
-        0,
-        "RX LoRa"
-    );
-
-    display.drawString(
-        0,
-        15,
-        "Aguardando..."
-    );
-
+    display.drawString(0, 0, "RX LoRa");
+    display.drawString(0, 15, "Aguardando...");
     display.display();
 
-
-    // --------------------------------------------------------
     // Inicia recepção
-    // --------------------------------------------------------
-
     Radio.Rx(0);
 }
 
-
 // LOOP
-
 void loop()
 {
-    // --------------------------------------------------------
     // Processa rádio
-    // --------------------------------------------------------
-
     Radio.IrqProcess();
 
-
-    // --------------------------------------------------------
     // Atualiza display
-    // --------------------------------------------------------
-
     static unsigned long ultimoDisplay = 0;
-
 
     if (millis() - ultimoDisplay >= 250)
     {
         ultimoDisplay = millis();
 
-
-        if (
-            experimentoIniciado &&
-            !experimentoFinalizado
-        )
+        if (experimentoIniciado && !experimentoFinalizado)
         {
             atualizarDisplay();
         }
     }
 
-
-    // --------------------------------------------------------
     // Informações no Serial
-    // --------------------------------------------------------
-
     if (pacoteRecebido)
     {
         pacoteRecebido = false;
 
-
         if (pacotesRecebidos % 10 == 0)
         {
-            bool integridadeOK =
-                verificarIntegridade(
-                    (uint8_t *)rxpacket,
-                    tamanhoRecebido
-                );
-
+            bool integridadeOK = verificarIntegridade((uint8_t *)rxpacket, tamanhoRecebido);
 
             Serial.print("Recebidos: ");
             Serial.print(pacotesRecebidos);
-
-
             Serial.print(" | Tamanho: ");
             Serial.print(tamanhoRecebido);
-
-
             Serial.print(" | RSSI: ");
             Serial.print(rssiAtual);
             Serial.print(" dBm");
-
-
             Serial.print(" | SNR: ");
             Serial.print(snrAtual);
             Serial.print(" dB");
-
-
             Serial.print(" | Integridade: ");
-
 
             if (integridadeOK)
             {
